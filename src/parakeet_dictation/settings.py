@@ -35,11 +35,30 @@ ACCURACY_PRESETS = {
     "accurate": {"context_size": (256, 64), "depth": 12, "batch_seconds": 1.0},
 }
 
+# The push-to-talk trigger. "modifiers" is a list of specific pynput Key names
+# (e.g. "alt_r", not generic "alt") and "key" is either None (a modifier-only
+# combo — held keys start recording, releasing any of them stops it) or a
+# single regular key's name/character (a chord — see main.py's _run_chord_listener
+# for why chords can't preserve left/right specificity the way modifier-only
+# combos can).
+DEFAULT_HOTKEY = {"modifiers": ["alt_r"], "key": None}
+
 DEFAULTS = {
     "accuracy_mode": "accurate",
     "llm_enabled": False,
     "verbose_logging": False,
+    "hotkey": DEFAULT_HOTKEY,
 }
+
+
+def _is_valid_hotkey(hotkey) -> bool:
+    return (
+        isinstance(hotkey, dict)
+        and isinstance(hotkey.get("modifiers"), list)
+        and len(hotkey["modifiers"]) > 0
+        and all(isinstance(m, str) for m in hotkey["modifiers"])
+        and (hotkey.get("key") is None or isinstance(hotkey["key"], str))
+    )
 
 SETTINGS_PATH = (
     Path.home() / "Library" / "Application Support" / "parakeet-dictation" / "settings.json"
@@ -49,6 +68,7 @@ SETTINGS_PATH = (
 def load_settings() -> dict:
     """Load persisted settings, seeded/overridden by explicit env vars for this launch."""
     settings = dict(DEFAULTS)
+    settings["hotkey"] = {"modifiers": list(DEFAULT_HOTKEY["modifiers"]), "key": DEFAULT_HOTKEY["key"]}
     try:
         if SETTINGS_PATH.exists():
             saved = json.loads(SETTINGS_PATH.read_text())
@@ -63,6 +83,8 @@ def load_settings() -> dict:
 
     if settings["accuracy_mode"] not in ACCURACY_PRESETS:
         settings["accuracy_mode"] = DEFAULTS["accuracy_mode"]
+    if not _is_valid_hotkey(settings["hotkey"]):
+        settings["hotkey"] = {"modifiers": list(DEFAULT_HOTKEY["modifiers"]), "key": DEFAULT_HOTKEY["key"]}
 
     return settings
 

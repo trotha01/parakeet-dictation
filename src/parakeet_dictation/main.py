@@ -16,7 +16,7 @@ from parakeet_mlx import from_pretrained
 import signal
 from .text_selection import TextSelection
 from .logger_config import setup_logging
-from .settings import ACCURACY_PRESETS, load_settings, save_settings
+from .settings import ACCURACY_PRESETS, DEFAULT_HOTKEY, load_settings, save_settings
 from mlx_lm import load as mlx_load, generate as mlx_generate
 import argparse
 
@@ -64,6 +64,67 @@ def _is_model_cached(repo_id: str) -> bool:
     except Exception:
         return False
 
+
+# ---------------------------
+# Hotkey key <-> name helpers
+#
+# A captured/stored hotkey is a plain dict: {"modifiers": [<pynput Key name>, ...],
+# "key": <character or special-key name, or None>}.
+#
+# IMPORTANT, verified against pynput's actual macOS Key enum (not assumed): only
+# the RIGHT-side modifier is a distinct enum member (alt_r, ctrl_r, cmd_r,
+# shift_r). "alt_l" etc. are not real — pynput's Key.alt_l is literally an alias
+# for the generic Key.alt, which is what a LEFT modifier press actually reports
+# as. So the true set of distinguishable modifier identities on this platform is
+# {alt, alt_r, ctrl, ctrl_r, cmd, cmd_r, shift, shift_r} — the bare name means
+# "left, or unspecified/either," never a separate "_l" name.
+# ---------------------------
+
+_MODIFIER_NAMES = {
+    "alt", "alt_r", "ctrl", "ctrl_r", "cmd", "cmd_r", "shift", "shift_r",
+}
+_MODIFIER_FAMILY = {  # for building a GlobalHotKeys chord token: <alt>, <ctrl>, etc.
+    "alt": "alt", "alt_r": "alt",
+    "ctrl": "ctrl", "ctrl_r": "ctrl",
+    "cmd": "cmd", "cmd_r": "cmd",
+    "shift": "shift", "shift_r": "shift",
+}
+_DISPLAY_NAMES = {
+    "alt": "Option", "alt_r": "Right Option",
+    "ctrl": "Control", "ctrl_r": "Right Control",
+    "cmd": "Command", "cmd_r": "Right Command",
+    "shift": "Shift", "shift_r": "Right Shift",
+}
+
+
+def _is_modifier_key(key) -> bool:
+    return isinstance(key, keyboard.Key) and key.name in _MODIFIER_NAMES
+
+
+def _key_to_name(key):
+    """A pynput Key/KeyCode -> the string this app stores it as, or None if
+    it's some other special key (e.g. Escape) not meant to be bindable."""
+    if isinstance(key, keyboard.Key):
+        return key.name
+    if isinstance(key, keyboard.KeyCode) and key.char:
+        return key.char.lower()
+    return None
+
+
+def _name_to_key(name):
+    """The reverse of _key_to_name."""
+    special = getattr(keyboard.Key, name, None)
+    if isinstance(special, keyboard.Key):
+        return special
+    return keyboard.KeyCode.from_char(name)
+
+
+def _hotkey_display_name(hotkey: dict) -> str:
+    parts = [_DISPLAY_NAMES.get(m, m) for m in hotkey["modifiers"]]
+    if hotkey.get("key"):
+        parts.append(hotkey["key"].upper())
+    return " + ".join(parts)
+
 class WhisperDictationApp(rumps.App):
     def __init__(self):
         super(WhisperDictationApp, self).__init__("🎙️", quit_button=rumps.MenuItem("Quit"))
@@ -95,12 +156,21 @@ class WhisperDictationApp(rumps.App):
         self.verbose_item = rumps.MenuItem("Verbose Logging", callback=self.toggle_verbose_logging)
         self.verbose_item.state = self.settings["verbose_logging"]
 
+        self.hotkey_item = rumps.MenuItem(
+            f"Hotkey: {_hotkey_display_name(self.settings['hotkey'])}",
+        )
+        self.customize_hotkey_item = rumps.MenuItem("Customize...", callback=self.customize_hotkey)
+        self.reset_hotkey_item = rumps.MenuItem("Reset to Default (Right Option)", callback=self.reset_hotkey)
+        self.hotkey_item.add(self.customize_hotkey_item)
+        self.hotkey_item.add(self.reset_hotkey_item)
+
         self.menu = [
             self.recording_menu_item,
             None,
             accuracy_menu,
             self.llm_item,
             self.verbose_item,
+            self.hotkey_item,
             None,
             self.status_item,
         ]
@@ -156,8 +226,10 @@ class WhisperDictationApp(rumps.App):
 
         # Hotkey state
         self.is_recording_with_hotkey = False
+        self._active_hotkey_stoppers = []
+        self._capturing_hotkey = False
 
-        # Set up global hotkeys (Ctrl+Alt+A) and release listener
+        # Set up the configurable global push-to-talk hotkey
         self.setup_global_monitor()
 
         logger.info("Started WhisperDictation app. Look for 🎙️ in your menu bar.")
@@ -252,40 +324,189 @@ class WhisperDictationApp(rumps.App):
 
     # ---------------------------
     # Global hotkey + release monitor
+    #
+    # Configurable via the Hotkey menu (Customize.../Reset to Default), stored as
+    # self.settings["hotkey"]. Two different pynput mechanisms depending on what's
+    # configured, chosen automatically:
+    #   - Modifier-only combo (no regular key): _run_modifier_only_listener, a
+    #     generalization of the original hardcoded right-Option-only behavior —
+    #     start when every required modifier is held, stop when any releases.
+    #     Preserves left/right specificity.
+    #   - Modifier(s) + a regular key (a "chord", e.g. Ctrl+Option+A):
+    #     _run_chord_listener, via GlobalHotKeys — the same mechanism upstream
+    #     used for its original Ctrl+Alt+A hotkey. GlobalHotKeys canonicalizes
+    #     modifiers to their generic (side-independent) form before matching
+    #     (verified against pynput's own HotKey.canonical/parse), so a captured
+    #     "right Option" collapses to "either Option" for chords specifically —
+    #     unavoidable with this library, not a bug here.
+    # Both run inside _hotkey_loop, which rebuilds from current settings every
+    # time a listener stops — including a deliberate stop from customize_hotkey/
+    # reset_hotkey, which is how a rebind takes effect without an app restart.
     # ---------------------------
     def setup_global_monitor(self):
-        self.key_monitor_thread = threading.Thread(target=self.monitor_keys, daemon=True)
+        self.key_monitor_thread = threading.Thread(target=self._hotkey_loop, daemon=True)
         self.key_monitor_thread.start()
 
-    def monitor_keys(self):
-        """
-        Hold RIGHT Option to record; release to transcribe.
+    def _hotkey_loop(self):
+        while not exit_flag:
+            try:
+                self._run_hotkey_listener()
+            except Exception as e:
+                logger.error(f"Error with keyboard listeners: {e}")
+                logger.error("Please check Accessibility/Input Monitoring permissions in System Settings.")
+                return
+            # _capture_hotkey_thread stops us and runs its own temporary listener
+            # while it works; wait for it to finish (and write new settings)
+            # rather than immediately rebuilding the old hotkey out from under it.
+            while self._capturing_hotkey and not exit_flag:
+                time.sleep(0.1)
 
-        A bare modifier cannot be expressed as a GlobalHotKeys chord, so this
-        uses a plain Listener on one key. LEFT Option is deliberately ignored,
-        so every normal Option shortcut keeps working.
-        """
-        TRIGGER = keyboard.Key.alt_r
+    def _run_hotkey_listener(self):
+        hotkey = self.settings["hotkey"]
+        logger.info(f"Global hotkey listener: hold {_hotkey_display_name(hotkey)} to record")
+        if hotkey.get("key"):
+            self._run_chord_listener(hotkey["modifiers"], hotkey["key"])
+        else:
+            self._run_modifier_only_listener(hotkey["modifiers"])
+
+    def _run_modifier_only_listener(self, modifier_names):
+        required = {_name_to_key(name) for name in modifier_names}
+        held = set()
 
         def on_press(key):
-            if key == TRIGGER and not self.recording and not self.is_recording_with_hotkey:
-                self.is_recording_with_hotkey = True
-                logger.info("STARTING recording via right-Option")
-                self.start_recording()
+            if key in required:
+                held.add(key)
+                if held == required and not self.recording and not self.is_recording_with_hotkey:
+                    self.is_recording_with_hotkey = True
+                    logger.info(f"STARTING recording via {' + '.join(modifier_names)}")
+                    self.start_recording()
 
         def on_release(key):
-            if key == TRIGGER and self.is_recording_with_hotkey and self.recording:
-                logger.info("STOPPING recording via right-Option release")
+            if key in required:
+                held.discard(key)
+                if self.is_recording_with_hotkey and self.recording:
+                    logger.info(f"STOPPING recording via {' + '.join(modifier_names)} release")
+                    self.is_recording_with_hotkey = False
+                    self.stop_recording()
+
+        listener = keyboard.Listener(on_press=on_press, on_release=on_release)
+        self._active_hotkey_stoppers = [listener.stop]
+        with listener:
+            listener.join()
+
+    def _run_chord_listener(self, modifier_names, key_name):
+        families = sorted({_MODIFIER_FAMILY[m] for m in modifier_names})
+        chord_str = "+".join(f"<{f}>" for f in families) + "+" + key_name
+
+        def start():
+            if not self.recording and not self.is_recording_with_hotkey:
+                self.is_recording_with_hotkey = True
+                logger.info(f"STARTING recording via {chord_str}")
+                self.start_recording()
+
+        # Release-detection watches both the generic (left/either) and the
+        # right-specific form of every modifier family involved, since a real
+        # keypress reports as one of those even though the chord itself only
+        # matched on the generic family.
+        release_keys = set()
+        for family in families:
+            release_keys.add(getattr(keyboard.Key, family, None))
+            release_keys.add(getattr(keyboard.Key, f"{family}_r", None))
+        release_keys.discard(None)
+
+        def on_release(key):
+            if key in release_keys and self.is_recording_with_hotkey and self.recording:
+                logger.info(f"STOPPING recording via {chord_str} release")
                 self.is_recording_with_hotkey = False
                 self.stop_recording()
 
-        logger.info("Global hotkey listener: hold RIGHT Option to record")
+        hotkeys = keyboard.GlobalHotKeys({chord_str: start})
+        release_listener = keyboard.Listener(on_release=on_release)
+        self._active_hotkey_stoppers = [hotkeys.stop, release_listener.stop]
+        with hotkeys, release_listener:
+            hotkeys.join()
+
+    def customize_hotkey(self, sender):
+        if self._capturing_hotkey:
+            return
+        self._capturing_hotkey = True
+        threading.Thread(target=self._capture_hotkey_thread, daemon=True).start()
+
+    def _capture_hotkey_thread(self):
+        for stop in self._active_hotkey_stoppers:
+            try:
+                stop()
+            except Exception:
+                pass
+
+        self.title = "🎙️ (Press new hotkey...)"
+        self.status_item.title = "Status: Press and hold your new hotkey, then release..."
+        logger.info("Capture mode: press and hold your desired hotkey, then release it.")
+
         try:
-            with keyboard.Listener(on_press=on_press, on_release=on_release) as listener:
-                listener.join()
-        except Exception as e:
-            logger.error(f"Error with keyboard listeners: {e}")
-            logger.error("Please check Accessibility/Input Monitoring permissions in System Settings.")
+            while True:
+                held = set()
+                captured = set()
+
+                def on_press(key):
+                    held.add(key)
+                    captured.update(held)
+
+                def on_release(key):
+                    return False  # stop the listener on the first release
+
+                with keyboard.Listener(on_press=on_press, on_release=on_release) as listener:
+                    listener.join()
+
+                if not captured:
+                    continue
+
+                modifiers = [k for k in captured if _is_modifier_key(k)]
+                regular = [k for k in captured if not _is_modifier_key(k)]
+
+                if len(regular) > 1:
+                    logger.warning("Captured more than one non-modifier key — hold just one regular key (plus modifiers), try again.")
+                    self.status_item.title = "Status: Only one regular key allowed — try again"
+                    continue
+                if regular and not modifiers:
+                    logger.warning("A bare key with no modifier would type into whatever you're focused on — hold at least one modifier too, try again.")
+                    self.status_item.title = "Status: Need at least one modifier — try again"
+                    continue
+                if not modifiers:
+                    continue
+
+                mod_names = [n for n in (_key_to_name(k) for k in modifiers) if n]
+                key_name = _key_to_name(regular[0]) if regular else None
+                if regular and key_name is None:
+                    logger.warning("Didn't recognize that key — try again.")
+                    continue
+
+                self.settings["hotkey"] = {"modifiers": mod_names, "key": key_name}
+                save_settings(self.settings)
+                break
+        finally:
+            self._capturing_hotkey = False
+            self.title = "🎙️"
+
+        display = _hotkey_display_name(self.settings["hotkey"])
+        self.hotkey_item.title = f"Hotkey: {display}"
+        self.status_item.title = "Status: Ready"
+        logger.info(f"Hotkey bound to {display}")
+        try:
+            rumps.notification("Parakeet Dictation", "Hotkey updated", f"Bound to {display}")
+        except Exception:
+            pass
+
+    def reset_hotkey(self, sender):
+        self.settings["hotkey"] = {"modifiers": list(DEFAULT_HOTKEY["modifiers"]), "key": DEFAULT_HOTKEY["key"]}
+        save_settings(self.settings)
+        self.hotkey_item.title = f"Hotkey: {_hotkey_display_name(self.settings['hotkey'])}"
+        logger.info("Hotkey reset to default (right Option)")
+        for stop in self._active_hotkey_stoppers:
+            try:
+                stop()
+            except Exception:
+                pass
 
     # ---------------------------
     # Menu item click
@@ -351,8 +572,13 @@ class WhisperDictationApp(rumps.App):
         # this selection" (Qwen path below) — that stays batch-transcribed on release.
         # Otherwise, type live as you talk via the MLX streaming decoder. If text
         # editing is disabled, a selection no longer means anything special, so stay
-        # live rather than needlessly taking the slower batch path.
-        has_selection = bool(self.text_selector.get_selected_text())
+        # live rather than needlessly taking the slower batch path — and, just as
+        # importantly, skip calling get_selected_text() at all in that case: it
+        # simulates Cmd+C (press synthetic Cmd, tap 'c', release synthetic Cmd), and
+        # if your hotkey itself involves physically holding Cmd, that synthetic
+        # Cmd-release looks identical to you actually letting go — instantly firing
+        # a false stop before any real audio is captured.
+        has_selection = self.settings["llm_enabled"] and bool(self.text_selector.get_selected_text())
         self._live_mode = not (has_selection and self.settings["llm_enabled"])
         if self._live_mode:
             self._stream_queue = queue.Queue()
