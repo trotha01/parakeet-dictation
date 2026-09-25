@@ -4,6 +4,7 @@ import io
 import time
 import tempfile
 import threading
+import concurrent.futures
 import pyaudio
 import wave
 import numpy as np
@@ -56,10 +57,17 @@ class WhisperDictationApp(rumps.App):
         self.keyboard_controller = Controller()
         self.text_selector = TextSelection()
 
-        # Initialize Parakeet model (async)
+        # Initialize Parakeet model (async).
+        # All MLX calls (load + every transcription) must run on this single
+        # persistent worker thread: MLX ties lazily-evaluated arrays to the
+        # stream of the thread that created them, so loading the model on one
+        # thread and transcribing on a fresh thread each time raises
+        # "There is no Stream(cpu, 1) in current thread."
         self.model = None
-        self.load_model_thread = threading.Thread(target=self.load_model, daemon=True)
-        self.load_model_thread.start()
+        self.mlx_executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="mlx-worker"
+        )
+        self.mlx_executor.submit(self.load_model)
 
         # NEW: Initialize Qwen (MLX) editor model (async)
         self.llm_model = None
@@ -286,8 +294,7 @@ class WhisperDictationApp(rumps.App):
         self.status_item.title = "Status: Transcribing..."
         logger.info("Recording stopped. Transcribing...")
 
-        transcribe_thread = threading.Thread(target=self.process_recording, daemon=True)
-        transcribe_thread.start()
+        self.mlx_executor.submit(self.process_recording)
 
     def process_recording(self):
         try:
