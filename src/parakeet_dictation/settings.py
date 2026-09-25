@@ -43,9 +43,55 @@ ACCURACY_PRESETS = {
 # combos can).
 DEFAULT_HOTKEY = {"modifiers": ["alt_r"], "key": None}
 
+# Spoken word -> literal symbol, applied to transcribed text before it's typed
+# when "symbol_words_enabled" is on (see main.py's _apply_symbol_words). Only
+# covers words that are unlikely to show up as themselves in ordinary prose —
+# deliberately leaves out common nouns/punctuation-ish words like "period",
+# "comma", "star", "dot", "bar", "hash" that would misfire constantly outside
+# of deliberate symbol dictation.
+SYMBOL_WORDS = {
+    "tilde": "~",
+    "backtick": "`",
+    "underscore": "_",
+    "ampersand": "&",
+    "asterisk": "*",
+    "caret": "^",
+    "pipe": "|",
+    "backslash": "\\",
+    "forward slash": "/",
+    "slash": "/",
+    "hyphen": "-",
+    "dash": "-",
+    "equals sign": "=",
+    "equal sign": "=",
+    "plus sign": "+",
+    "at sign": "@",
+    "at symbol": "@",
+    "pound sign": "#",
+    "hash sign": "#",
+    "hashtag": "#",
+    "percent sign": "%",
+    "dollar sign": "$",
+    "open paren": "(",
+    "open parenthesis": "(",
+    "close paren": ")",
+    "close parenthesis": ")",
+    "open bracket": "[",
+    "close bracket": "]",
+    "open brace": "{",
+    "open curly": "{",
+    "close brace": "}",
+    "close curly": "}",
+    "less than": "<",
+    "greater than": ">",
+    "double quote": '"',
+    "single quote": "'",
+}
+
 DEFAULTS = {
     "accuracy_mode": "accurate",
     "llm_enabled": False,
+    "symbol_words_enabled": False,
     "verbose_logging": False,
     "hotkey": DEFAULT_HOTKEY,
 }

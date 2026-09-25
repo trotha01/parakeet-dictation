@@ -16,7 +16,8 @@ from parakeet_mlx import from_pretrained
 import signal
 from .text_selection import TextSelection
 from .logger_config import setup_logging
-from .settings import ACCURACY_PRESETS, DEFAULT_HOTKEY, load_settings, save_settings
+import re
+from .settings import ACCURACY_PRESETS, DEFAULT_HOTKEY, SYMBOL_WORDS, load_settings, save_settings
 from mlx_lm import load as mlx_load, generate as mlx_generate
 import argparse
 
@@ -57,6 +58,21 @@ SILENCE_TIMEOUT_SECS = float(os.getenv("PARAKEET_SILENCE_TIMEOUT_SECS", "15"))
 _SILENCE_RMS_THRESHOLD = 5e-4  # same floor _stream_feed_loop uses for auto-gain
 
 LLM_MENU_TITLE = "Enable Text Editing (Qwen)"
+
+# Longest phrase first so e.g. "open parenthesis" matches whole rather than
+# leaving "open " to fall through — though \b boundaries below already stop
+# "open paren" from matching inside "open parenthesis" on their own.
+_SYMBOL_WORD_PATTERN = re.compile(
+    r"\b(" + "|".join(re.escape(k) for k in sorted(SYMBOL_WORDS, key=len, reverse=True)) + r")\b",
+    re.IGNORECASE,
+)
+
+
+def _apply_symbol_words(text: str) -> str:
+    """Replace spoken symbol names ("tilde", "open paren", ...) with the
+    literal symbol, per SYMBOL_WORDS. Gated behind settings["symbol_words_enabled"]
+    since it's a real tradeoff against ordinary prose dictation, not a pure win."""
+    return _SYMBOL_WORD_PATTERN.sub(lambda m: SYMBOL_WORDS[m.group(0).lower()], text)
 
 
 def _is_model_cached(repo_id: str) -> bool:
@@ -162,6 +178,9 @@ class WhisperDictationApp(rumps.App):
         self.verbose_item = rumps.MenuItem("Verbose Logging", callback=self.toggle_verbose_logging)
         self.verbose_item.state = self.settings["verbose_logging"]
 
+        self.symbol_words_item = rumps.MenuItem('Type Symbols ("tilde" → ~)', callback=self.toggle_symbol_words)
+        self.symbol_words_item.state = self.settings["symbol_words_enabled"]
+
         self.hotkey_item = rumps.MenuItem(
             f"Hotkey: {_hotkey_display_name(self.settings['hotkey'])}",
         )
@@ -175,6 +194,7 @@ class WhisperDictationApp(rumps.App):
             None,
             accuracy_menu,
             self.llm_item,
+            self.symbol_words_item,
             self.verbose_item,
             self.hotkey_item,
             None,
@@ -569,6 +589,13 @@ class WhisperDictationApp(rumps.App):
         save_settings(self.settings)
         logger.setLevel(_logging.INFO if enabled else _logging.WARNING)
 
+    def toggle_symbol_words(self, sender):
+        enabled = not sender.state
+        sender.state = enabled
+        self.settings["symbol_words_enabled"] = enabled
+        save_settings(self.settings)
+        logger.info(f"Symbol words {'enabled' if enabled else 'disabled'}")
+
     # ---------------------------
     # Recording & transcription
     # ---------------------------
@@ -730,6 +757,12 @@ class WhisperDictationApp(rumps.App):
         """
         finalized_text = "".join(t.text for t in stream.finalized_tokens)
         draft_text = "".join(t.text for t in stream.draft_tokens)
+        if self.settings["symbol_words_enabled"]:
+            # Applied here (before the length comparisons below) so every
+            # length/prefix check downstream operates on the same
+            # already-substituted strings consistently across updates.
+            finalized_text = _apply_symbol_words(finalized_text)
+            draft_text = _apply_symbol_words(draft_text)
 
         if len(finalized_text) + len(draft_text) < len(self._typed_finalized) + len(self._typed_draft):
             return
@@ -913,6 +946,8 @@ class WhisperDictationApp(rumps.App):
 
     def insert_text(self, text):
         # Minimal logging in hot path
+        if self.settings["symbol_words_enabled"]:
+            text = _apply_symbol_words(text)
         self.keyboard_controller.type(text)
 
     # NEW: Local edit using Qwen (MLX)
