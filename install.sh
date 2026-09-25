@@ -2,14 +2,14 @@
 # Install Parakeet Dictation: https://github.com/trotha01/parakeet-dictation
 #
 # Usage:
-#   curl -fsSL https://raw.githubusercontent.com/trotha01/parakeet-dictation/feature/live-streaming-dictation/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/trotha01/parakeet-dictation/main/install.sh | bash
 #
 # Safe to re-run: every step below is idempotent.
 
 set -euo pipefail
 
 REPO_URL="https://github.com/trotha01/parakeet-dictation.git"
-REPO_BRANCH="feature/live-streaming-dictation"
+REPO_BRANCH="main"
 
 step() { printf '\n\033[1m==> %s\033[0m\n' "$1"; }
 warn() { printf '\033[33mwarning:\033[0m %s\n' "$1" >&2; }

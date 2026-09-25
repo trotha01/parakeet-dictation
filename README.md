@@ -75,7 +75,7 @@ TBD
 Installs Homebrew's `portaudio`, `uv` if you don't have it, and the app itself, then opens the three permission panes you'll need to approve:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/trotha01/parakeet-dictation/feature/live-streaming-dictation/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/trotha01/parakeet-dictation/main/install.sh | bash
 ```
 
 Safe to re-run — every step is idempotent. Requires [Homebrew](https://brew.sh) already installed (the script checks and tells you if it isn't).
@@ -84,7 +84,7 @@ Safe to re-run — every step is idempotent. Requires [Homebrew](https://brew.sh
 
 ```bash
 brew install portaudio
-uv tool install "git+https://github.com/trotha01/parakeet-dictation.git@feature/live-streaming-dictation"
+uv tool install "git+https://github.com/trotha01/parakeet-dictation.git"
 ```
 
 ### Option C: hack on the source
