@@ -70,23 +70,29 @@ TBD
 
 ## Installation
 
-### 1. Install system deps
+### Option A: one-line install (recommended)
+
+Installs Homebrew's `portaudio`, `uv` if you don't have it, and the app itself, then opens the three permission panes you'll need to approve:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/trotha01/parakeet-dictation/feature/live-streaming-dictation/install.sh | bash
+```
+
+Safe to re-run — every step is idempotent. Requires [Homebrew](https://brew.sh) already installed (the script checks and tells you if it isn't).
+
+### Option B: manual install
 
 ```bash
 brew install portaudio
+uv tool install "git+https://github.com/trotha01/parakeet-dictation.git@feature/live-streaming-dictation"
 ```
 
-### 2. Install the app
+### Option C: hack on the source
 
-The simplest path — installs as an isolated CLI tool (`uv` fetches its own Python 3.12, no system Python or manual venv needed):
-
-```bash
-uv tool install git+https://github.com/trotha01/parakeet-dictation.git
-```
-
-To hack on the source instead (what this fork's own development uses):
+What this fork's own development uses:
 
 ```bash
+brew install portaudio
 git clone https://github.com/trotha01/parakeet-dictation.git
 cd parakeet-dictation
 uv tool install --editable .
@@ -94,7 +100,7 @@ uv tool install --editable .
 
 With `--editable`, edits to `src/parakeet_dictation/main.py` take effect on the next launch — no reinstall needed.
 
-Either way, this installs a `parakeet-dictation` executable (check with `which parakeet-dictation`).
+All three options install a `parakeet-dictation` executable (check with `which parakeet-dictation`).
 
 ---
 
