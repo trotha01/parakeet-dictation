@@ -42,7 +42,7 @@ Parakeet Dictation gives you **on-device** speech-to-text on macOS with a **sing
 ## Features
 
 - 🖥️ **Menu bar** app (stays out of your way)
-- 🎙️ **Push-to-talk**: hold **right Option** to record, release to stop — left Option is left alone so its normal shortcuts still work
+- 🎙️ **Push-to-talk**: hold **right Option** to record, release to stop — left Option is left alone so its normal shortcuts still work. Fully **customizable** from the menu bar, including multi-key combos like Ctrl+Option+A
 - ⚡ **Live streaming dictation**: words are typed as you talk (via `parakeet-mlx`'s streaming decoder), not only after you release the key
 - ⚡ **Local ASR** with **NVIDIA Parakeet** (Apple Silicon via MLX)
 - ⌨️ **Types directly at the cursor** in the foreground app
@@ -126,9 +126,9 @@ All optional, set as environment variables before launching. `PARAKEET_ENABLE_LL
 ### Push-to-talk dictation
 
 1. Launch the app (see Development or Background sections below).
-2. Click into any text field, then hold **right Option** to start recording. (Left Option is deliberately ignored, so its usual shortcuts — e.g. option-drag, special characters — keep working everywhere else.)
+2. Click into any text field, then hold **right Option** (the default — see [Menu bar controls](#menu-bar-controls) to change it) to start recording. Left Option is deliberately ignored by default, so its usual shortcuts — e.g. option-drag, special characters — keep working.
 3. Speak normally. Words are typed as you go, not only at the end.
-4. Release right Option to stop. Any words still being refined by the decoder get one last reconciliation pass.
+4. Release the hotkey to stop. Any words still being refined by the decoder get one last reconciliation pass.
 
 ### Voice-driven text editing (Qwen via MLX)
 
@@ -145,14 +145,19 @@ When no text is selected, your speech is always treated as plain dictation, whet
 
 ### Menu bar controls
 
-- **Start/Stop Recording** — toggles recording (same as holding right Option)
+- **Start/Stop Recording** — toggles recording (same as holding the hotkey)
 - **Accuracy** — Fast / Balanced / Accurate, the presets from [Configuration](#configuration); takes effect on your next recording
 - **Enable Text Editing (Qwen)** — same as `PARAKEET_ENABLE_LLM`, but live: toggling it on loads Qwen in the background on first use rather than requiring a restart. Shows "(downloads ~1GB)" until the model is actually cached
 - **Verbose Logging** — same as `PARAKEET_LOG=info`, toggled live
+- **Hotkey: ...** — shows the current binding; its submenu has:
+  - **Customize...** — enters capture mode (menu bar icon shows "Press new hotkey..."). Press and hold your desired combo, then release — whatever was held together becomes the new binding. Works for a single modifier (e.g. right Option), multiple modifiers held together with no regular key (e.g. Shift+Command), or a modifier plus one regular key (e.g. Ctrl+Option+A). Rejects a bare regular key with no modifier (it would type into whatever's focused instead of triggering recording) and combos with more than one regular key — you'll be prompted to try again.
+  - **Reset to Default (Right Option)** — one click back to the default.
+
+  Chords (modifier + a regular key) can't preserve left/right specificity — `pynput`'s `GlobalHotKeys` mechanism canonicalizes modifiers to a generic side before matching, so a captured "right Option+A" becomes "either Option+A." Modifier-only combos (including multi-modifier ones) don't have this limitation.
 - **Status: ...** — not clickable, just shows current state
 - **Quit** — exits the app
 
-All three settings persist across relaunches (`~/Library/Application Support/parakeet-dictation/settings.json`). The `PARAKEET_*` env vars still work too — they seed that setting for the launch they're set on, but the menu is what's saved.
+All four settings persist across relaunches (`~/Library/Application Support/parakeet-dictation/settings.json`). The `PARAKEET_*` env vars still work too — they seed that setting for the launch they're set on, but the menu is what's saved.
 
 ---
 
@@ -161,7 +166,7 @@ All three settings persist across relaunches (`~/Library/Application Support/par
 Grant all three to whatever app actually launches the process — if you run it from a terminal, that's your terminal app (iTerm, Terminal.app, etc.), not `parakeet-dictation` itself:
 
 - **Accessibility**: System Settings → Privacy & Security → Accessibility → allow your terminal app
-- **Input Monitoring**: System Settings → Privacy & Security → Input Monitoring → allow your terminal app — without this, the global right-Option listener silently never fires
+- **Input Monitoring**: System Settings → Privacy & Security → Input Monitoring → allow your terminal app — without this, the global hotkey listener silently never fires
 - **Microphone**: System Settings → Privacy & Security → Microphone → allow your terminal app — without this, recording *looks* like it's working (the menu bar shows "Recording...", no error appears) but every session captures silence and ends with "No speech detected"
 
 After granting any of these, fully quit and relaunch the app — permission changes don't apply to an already-running process.
@@ -190,6 +195,7 @@ pkill -f parakeet-dictation
 - Launch hangs indefinitely with no log output past the startup warnings: usually a stalled Hugging Face Hub network check, not a real hang — killing and relaunching with `HF_HUB_OFFLINE=1` (once the model is already cached locally) skips it
 - High CPU / slow first response: the first recording after launch warms up the model; later ones are faster
 - An extra word appears at the end of some dictations: expected occasionally — the chunk(s) right after you release the key are more likely to be trailing breath/noise than speech, and very quiet audio there is deliberately not auto-gained as aggressively as mid-utterance for this reason (see the comments around `silence_threshold` in `main.py` if tuning further)
+- A custom hotkey that includes Cmd stops recording almost instantly, every time, even with a real ~1s hold: this is a known interaction, not random flakiness — it only shows up if **Enable Text Editing (Qwen)** is also on. Checking for a text selection simulates Cmd+C (press synthetic Cmd, tap 'c', release synthetic Cmd); if your hotkey itself is physically holding Cmd down, that synthetic release looks identical to you letting go, so the hotkey's own release listener fires immediately. Workaround: don't combine a Cmd-involving hotkey with text editing enabled — either pick a hotkey without Cmd, or leave text editing off.
 
 ---
 
@@ -233,9 +239,9 @@ PARAKEET_LOG=debug parakeet-dictation
 
 This is a fork of [osadalakmal/parakeet-dictation](https://github.com/osadalakmal/parakeet-dictation), diverged over one evening of active development. Substantive changes from upstream `main`:
 
-- **Hotkey**: upstream used a `Ctrl+Alt+A` chord (`keyboard.GlobalHotKeys`, plus a separate listener that stopped on releasing either modifier). This fork holds **right Option** alone — left Option is deliberately left alone so its usual shortcuts (option-drag, special characters) keep working. See [Push-to-talk dictation](#push-to-talk-dictation).
+- **Hotkey**: upstream used a hardcoded `Ctrl+Alt+A` chord (`keyboard.GlobalHotKeys`, plus a separate listener that stopped on releasing either modifier). This fork defaults to holding **right Option** alone — left Option is deliberately left alone so its usual shortcuts (option-drag, special characters) keep working — and the hotkey is fully **customizable** from the menu bar (single modifier, multiple modifiers held together, or a modifier+regular-key chord like the original Ctrl+Alt+A), with no restart needed to change it. See [Push-to-talk dictation](#push-to-talk-dictation) and [Menu bar controls](#menu-bar-controls).
 - **Live streaming dictation**: upstream only transcribed once, on release (one batch call). Here, words are typed as you talk via `parakeet-mlx`'s streaming decoder (`transcribe_stream`) — see `_stream_feed_loop` / `_apply_stream_result` in `main.py`.
-- **Menu bar settings panel**: added an Accuracy submenu (Fast/Balanced/Accurate presets trading latency for context/depth), an Enable Text Editing toggle, and Verbose Logging — all persisted to `~/Library/Application Support/parakeet-dictation/settings.json` (see `settings.py`). Upstream's menu was just Start/Stop Recording and a status line.
+- **Menu bar settings panel**: added an Accuracy submenu (Fast/Balanced/Accurate presets trading latency for context/depth), an Enable Text Editing toggle, Verbose Logging, and the Hotkey customization submenu above — all persisted to `~/Library/Application Support/parakeet-dictation/settings.json` (see `settings.py`). Upstream's menu was just Start/Stop Recording and a status line.
 - **Text editing (Qwen) is opt-in**: upstream always loaded the Qwen2.5-1.5B MLX model at startup. Here it's off by default — enable via the "Enable Text Editing (Qwen)" menu item or `PARAKEET_ENABLE_LLM=1`, so a launch that doesn't use it doesn't pay to load/hold it.
 - **Default ASR model**: `parakeet-tdt-0.6b-v2` → `parakeet-tdt-0.6b-v3`, and now configurable via `PARAKEET_MODEL` (hardcoded upstream).
 - **MLX threading fix**: model loading and every transcription now run on one persistent worker thread (`concurrent.futures.ThreadPoolExecutor(max_workers=1)`) instead of ad-hoc `threading.Thread`s. MLX ties lazily-evaluated arrays to the stream of the thread that created them, so crossing threads — as upstream's ad-hoc threads did — could crash with `RuntimeError: There is no Stream(cpu, 1) in current thread.` (see [Development](#development)).
