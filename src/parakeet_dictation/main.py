@@ -16,6 +16,7 @@ from parakeet_mlx import from_pretrained
 import signal
 from .text_selection import TextSelection
 from .logger_config import setup_logging
+from .settings import ACCURACY_PRESETS, load_settings, save_settings
 from mlx_lm import load as mlx_load, generate as mlx_generate
 import argparse
 
@@ -49,12 +50,62 @@ signal.signal(signal.SIGTERM, signal_handler)
 # coming for this session" — see start_recording / stop_recording / _stream_feed_loop.
 _STREAM_STOP = object()
 
+LLM_MENU_TITLE = "Enable Text Editing (Qwen)"
+
+
+def _is_model_cached(repo_id: str) -> bool:
+    """Whether repo_id is already fully present in the local Hugging Face cache,
+    checked with no network access. Used to warn about the ~1GB Qwen download
+    in the menu item's title before the user opts into it."""
+    try:
+        from huggingface_hub import snapshot_download
+        snapshot_download(repo_id, local_files_only=True)
+        return True
+    except Exception:
+        return False
+
 class WhisperDictationApp(rumps.App):
     def __init__(self):
         super(WhisperDictationApp, self).__init__("🎙️", quit_button=rumps.MenuItem("Quit"))
+        self.settings = load_settings()
+
         self.status_item = rumps.MenuItem("Status: Ready")
         self.recording_menu_item = rumps.MenuItem("Start Recording")
-        self.menu = [self.recording_menu_item, None, self.status_item]
+
+        accuracy_menu = rumps.MenuItem("Accuracy")
+        self.accuracy_items = {}
+        for mode in ACCURACY_PRESETS:
+            item = rumps.MenuItem(mode.capitalize(), callback=self.set_accuracy_mode)
+            item.state = mode == self.settings["accuracy_mode"]
+            self.accuracy_items[mode] = item
+            accuracy_menu.add(item)
+
+        self.llm_config = {
+            "model_id": os.getenv("PARAKEET_LLM_MODEL", "mlx-community/Qwen2.5-1.5B-Instruct-4bit"),
+            "max_tokens": int(os.getenv("PARAKEET_LLM_MAX_TOKENS", "192")),
+            "temperature": float(os.getenv("PARAKEET_LLM_TEMP", "0.2")),
+            "top_p": float(os.getenv("PARAKEET_LLM_TOP_P", "0.9")),
+        }
+        llm_title = LLM_MENU_TITLE
+        if not _is_model_cached(self.llm_config["model_id"]):
+            llm_title += " (downloads ~1GB)"
+        self.llm_item = rumps.MenuItem(llm_title, callback=self.toggle_llm)
+        self.llm_item.state = self.settings["llm_enabled"]
+
+        self.verbose_item = rumps.MenuItem("Verbose Logging", callback=self.toggle_verbose_logging)
+        self.verbose_item.state = self.settings["verbose_logging"]
+
+        self.menu = [
+            self.recording_menu_item,
+            None,
+            accuracy_menu,
+            self.llm_item,
+            self.verbose_item,
+            None,
+            self.status_item,
+        ]
+        if self.settings["verbose_logging"] and not _log_env:
+            logger.setLevel(_logging.INFO)
 
         self.recording = False
         self.audio = pyaudio.PyAudio()
@@ -84,19 +135,18 @@ class WhisperDictationApp(rumps.App):
         self.llm_model = None
         self.llm_tokenizer = None
         self.llm_ready = False
-        self.llm_config = {
-            "model_id": os.getenv("PARAKEET_LLM_MODEL", "mlx-community/Qwen2.5-1.5B-Instruct-4bit"),
-            "max_tokens": int(os.getenv("PARAKEET_LLM_MAX_TOKENS", "192")),
-            "temperature": float(os.getenv("PARAKEET_LLM_TEMP", "0.2")),
-            "top_p": float(os.getenv("PARAKEET_LLM_TOP_P", "0.9")),
-        }
-        # The speak-an-edit rewrite loads Qwen2.5-1.5B eagerly at startup and holds it
-        # resident for a feature that is only used deliberately. Off unless asked for.
-        if os.environ.get("PARAKEET_ENABLE_LLM") == "1":
-            self.load_llm_thread = threading.Thread(target=self.load_llm, daemon=True)
-            self.load_llm_thread.start()
+        self.llm_loading = False
+        # The speak-an-edit rewrite loads Qwen2.5-1.5B and holds it resident for a
+        # feature that isn't always wanted; off by default (menu bar toggle, or
+        # PARAKEET_ENABLE_LLM=1 to start with it already on). Routed through
+        # mlx_executor like every other MLX call — mlx_lm is MLX too, so loading it
+        # on an ad-hoc thread and generating from it later on mlx_executor's worker
+        # would hit the same cross-thread Stream crash the ASR model has (see the
+        # comment above self.mlx_executor).
+        if self.settings["llm_enabled"]:
+            self.mlx_executor.submit(self.load_llm)
         else:
-            logger.info("LLM rewrite disabled (set PARAKEET_ENABLE_LLM=1 to enable)")
+            logger.info("LLM rewrite disabled (menu bar, or PARAKEET_ENABLE_LLM=1 to start enabled)")
 
         # Audio recording parameters
         self.format = pyaudio.paInt16
@@ -177,6 +227,7 @@ class WhisperDictationApp(rumps.App):
         if mlx_load is None or mlx_generate is None:
             logger.warning("mlx-lm not installed; local LLM edits disabled. `pip install mlx-lm` to enable.")
             return
+        self.llm_loading = True
         try:
             logger.info(f"Loading Qwen MLX model: {self.llm_config['model_id']}")
             # Many Qwen MLX models need trust_remote_code; eos token is usually set in tokenizer config.
@@ -192,9 +243,12 @@ class WhisperDictationApp(rumps.App):
                 logger.debug(f"Qwen warm-up skipped due to: {we}")
             self.llm_ready = True
             logger.info("Qwen MLX model ready for local edits")
+            self.llm_item.title = LLM_MENU_TITLE  # drop the "(downloads ~1GB)" note — it's cached now
         except Exception as e:
             logger.error(f"Failed to load Qwen MLX model: {e}")
             self.llm_ready = False
+        finally:
+            self.llm_loading = False
 
     # ---------------------------
     # Global hotkey + release monitor
@@ -245,6 +299,39 @@ class WhisperDictationApp(rumps.App):
             self.stop_recording()
             sender.title = "Start Recording"
 
+    def set_accuracy_mode(self, sender):
+        mode = next(m for m, item in self.accuracy_items.items() if item is sender)
+        for item in self.accuracy_items.values():
+            item.state = False
+        sender.state = True
+        self.settings["accuracy_mode"] = mode
+        save_settings(self.settings)
+        logger.info(f"Accuracy mode set to {mode} (takes effect on your next recording)")
+
+    def toggle_llm(self, sender):
+        enabled = not sender.state
+        sender.state = enabled
+        self.settings["llm_enabled"] = enabled
+        save_settings(self.settings)
+        if enabled:
+            if self.llm_ready:
+                logger.info("Text editing enabled")
+            elif self.llm_loading:
+                logger.info("Text-edit model is already loading")
+            else:
+                logger.info("Loading Qwen for text editing (enabled from menu)...")
+                self.status_item.title = "Status: Loading text-edit model..."
+                self.mlx_executor.submit(self.load_llm)
+        else:
+            logger.info("Text editing disabled")
+
+    def toggle_verbose_logging(self, sender):
+        enabled = not sender.state
+        sender.state = enabled
+        self.settings["verbose_logging"] = enabled
+        save_settings(self.settings)
+        logger.setLevel(_logging.INFO if enabled else _logging.WARNING)
+
     # ---------------------------
     # Recording & transcription
     # ---------------------------
@@ -262,8 +349,11 @@ class WhisperDictationApp(rumps.App):
 
         # Text selected before you start talking means "speak an edit instruction for
         # this selection" (Qwen path below) — that stays batch-transcribed on release.
-        # Otherwise, type live as you talk via the MLX streaming decoder.
-        self._live_mode = not bool(self.text_selector.get_selected_text())
+        # Otherwise, type live as you talk via the MLX streaming decoder. If text
+        # editing is disabled, a selection no longer means anything special, so stay
+        # live rather than needlessly taking the slower batch path.
+        has_selection = bool(self.text_selector.get_selected_text())
+        self._live_mode = not (has_selection and self.settings["llm_enabled"])
         if self._live_mode:
             self._stream_queue = queue.Queue()
 
@@ -404,30 +494,16 @@ class WhisperDictationApp(rumps.App):
         self._typed_draft = ""
         batch = bytearray()
         got_stop = False
-        # 1.0s batches: each add_audio call costs a large fixed overhead almost
-        # regardless of chunk size or depth (measured), so bigger batches spend
-        # more of that cost on actual audio. Traded some of the "live" feel for
-        # accuracy on request — text now first appears roughly ~1.4s after you
-        # start talking instead of ~0.8s.
-        batch_target_bytes = int(1.0 * self.rate) * 2  # ~1.0s of int16 mono PCM
+        # Preset chosen live from the Accuracy menu (see ACCURACY_PRESETS in
+        # settings.py for what each knob does and why raising both context and
+        # depth is safe now that _apply_stream_result has its shrink guard).
+        preset = ACCURACY_PRESETS[self.settings["accuracy_mode"]]
+        batch_target_bytes = int(preset["batch_seconds"] * self.rate) * 2
 
         try:
-            # right_context and depth both cost about the same to run (a large
-            # fixed per-call overhead dominates either way, measured), so
-            # there's no real reason not to raise them for accuracy — EXCEPT
-            # that parakeet_mlx computes how much audio must arrive before
-            # anything finalizes as drop_size = right_context * depth, not
-            # either one alone. (256, 64)/depth=12 gives drop_size = 768
-            # frames, ~61s: nothing finalizes during any normal dictation, so
-            # the whole utterance stays in the volatile draft state the entire
-            # time. That was the problem the first time these numbers came up
-            # (before _apply_stream_result had its shrink guard, a session
-            # entirely in draft state could get wiped at release) — now that
-            # the guard exists, "never finalizes" just means "always eligible
-            # for a real correction," which is what more accuracy needs. Went
-            # higher on both knobs than the safer (16, 4) tuning specifically
-            # because Trevor asked to trade latency for accuracy.
-            with self.model.transcribe_stream(context_size=(256, 64), depth=12) as stream:
+            with self.model.transcribe_stream(
+                context_size=preset["context_size"], depth=preset["depth"]
+            ) as stream:
                 while True:
                     try:
                         item = stream_queue.get(timeout=0.05)
@@ -539,7 +615,9 @@ class WhisperDictationApp(rumps.App):
             selected_text = self.text_selector.get_selected_text()
 
             # NEW: If there is selected text and local Qwen is ready → treat spoken text as instruction
-            if selected_text and self.llm_ready:
+            # (settings check so disabling via the menu takes effect immediately even after
+            # the model's already loaded, without needing to unload it)
+            if selected_text and self.llm_ready and self.settings["llm_enabled"]:
                 try:
                     self.status_item.title = "Status: Editing selection with Qwen..."
                     edited = self.enhance_with_qwen(text, selected_text)
