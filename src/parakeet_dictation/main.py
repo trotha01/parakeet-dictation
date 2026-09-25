@@ -5,6 +5,7 @@ import time
 import tempfile
 import threading
 import concurrent.futures
+import queue
 import pyaudio
 import wave
 import numpy as np
@@ -57,6 +58,12 @@ class WhisperDictationApp(rumps.App):
         self.keyboard_controller = Controller()
         self.text_selector = TextSelection()
 
+        # Live-dictation state (see start_recording / _stream_feed_loop).
+        # False whenever a selection turns this into a Qwen edit instruction instead.
+        self._live_mode = False
+        self._typed_finalized = ""
+        self._typed_draft = ""
+
         # Initialize Parakeet model (async).
         # All MLX calls (load + every transcription) must run on this single
         # persistent worker thread: MLX ties lazily-evaluated arrays to the
@@ -79,8 +86,13 @@ class WhisperDictationApp(rumps.App):
             "temperature": float(os.getenv("PARAKEET_LLM_TEMP", "0.2")),
             "top_p": float(os.getenv("PARAKEET_LLM_TOP_P", "0.9")),
         }
-        self.load_llm_thread = threading.Thread(target=self.load_llm, daemon=True)
-        self.load_llm_thread.start()
+        # The speak-an-edit rewrite loads Qwen2.5-1.5B eagerly at startup and holds it
+        # resident for a feature that is only used deliberately. Off unless asked for.
+        if os.environ.get("PARAKEET_ENABLE_LLM") == "1":
+            self.load_llm_thread = threading.Thread(target=self.load_llm, daemon=True)
+            self.load_llm_thread.start()
+        else:
+            logger.info("LLM rewrite disabled (set PARAKEET_ENABLE_LLM=1 to enable)")
 
         # Audio recording parameters
         self.format = pyaudio.paInt16
@@ -129,7 +141,7 @@ class WhisperDictationApp(rumps.App):
         self.title = "🎙️ (Loading...)"
         self.status_item.title = "Status: Loading Parakeet model..."
         try:
-            model_id = "mlx-community/parakeet-tdt-0.6b-v2"
+            model_id = os.environ.get("PARAKEET_MODEL", "mlx-community/parakeet-tdt-0.6b-v3")
             self.model = from_pretrained(model_id)
 
             # Warm-up: run a tiny silent clip once to trigger JIT/graph compilation & caches
@@ -189,32 +201,30 @@ class WhisperDictationApp(rumps.App):
 
     def monitor_keys(self):
         """
-        Start on '<ctrl>+<alt>+a' press, stop when either Ctrl or Alt is released.
-        Uses GlobalHotKeys for the chord and a separate Listener for modifier releases.
+        Hold RIGHT Option to record; release to transcribe.
+
+        A bare modifier cannot be expressed as a GlobalHotKeys chord, so this
+        uses a plain Listener on one key. LEFT Option is deliberately ignored,
+        so every normal Option shortcut keeps working.
         """
-        def start():
-            if not self.recording and not self.is_recording_with_hotkey:
+        TRIGGER = keyboard.Key.alt_r
+
+        def on_press(key):
+            if key == TRIGGER and not self.recording and not self.is_recording_with_hotkey:
                 self.is_recording_with_hotkey = True
-                logger.info("STARTING recording via Ctrl+Alt+A hotkey")
+                logger.info("STARTING recording via right-Option")
                 self.start_recording()
 
-        def maybe_stop_on_modifier_release(key):
-            from pynput import keyboard as kb
-            if key in (kb.Key.ctrl, kb.Key.ctrl_l, kb.Key.ctrl_r,
-                       kb.Key.alt, kb.Key.alt_l, kb.Key.alt_r):
-                if self.is_recording_with_hotkey and self.recording:
-                    logger.info("STOPPING recording via Ctrl/Alt release")
-                    self.is_recording_with_hotkey = False
-                    self.stop_recording()
+        def on_release(key):
+            if key == TRIGGER and self.is_recording_with_hotkey and self.recording:
+                logger.info("STOPPING recording via right-Option release")
+                self.is_recording_with_hotkey = False
+                self.stop_recording()
 
-        logger.info("Starting global hotkey listener: Ctrl+Alt+A (hold to record)")
+        logger.info("Global hotkey listener: hold RIGHT Option to record")
         try:
-            with keyboard.GlobalHotKeys({
-                '<ctrl>+<alt>+a': start,   # press to start
-            }) as hotkeys:
-                # Separate listener for key releases
-                with keyboard.Listener(on_release=maybe_stop_on_modifier_release):
-                    hotkeys.join()
+            with keyboard.Listener(on_press=on_press, on_release=on_release) as listener:
+                listener.join()
         except Exception as e:
             logger.error(f"Error with keyboard listeners: {e}")
             logger.error("Please check Accessibility/Input Monitoring permissions in System Settings.")
@@ -246,15 +256,27 @@ class WhisperDictationApp(rumps.App):
         self.status_item.title = "Status: Recording..."
         logger.info("Recording started. Speak now...")
 
+        # Text selected before you start talking means "speak an edit instruction for
+        # this selection" (Qwen path below) — that stays batch-transcribed on release.
+        # Otherwise, type live as you talk via the MLX streaming decoder.
+        self._live_mode = not bool(self.text_selector.get_selected_text())
+        if self._live_mode:
+            self._stream_queue = queue.Queue()
+
         # Use a callback stream for near-instant stop
         self.recording_thread = threading.Thread(target=self._record_audio_callback_loop, daemon=True)
         self.recording_thread.start()
+
+        if self._live_mode:
+            self.mlx_executor.submit(self._stream_feed_loop)
 
     def _record_audio_callback_loop(self):
         def _cb(in_data, frame_count, time_info, status_flags):
             # in_data is bytes for paInt16 mono frames
             if self.recording:
                 self.frames.append(in_data)
+                if self._live_mode:
+                    self._stream_queue.put(in_data)
                 return (None, pyaudio.paContinue)
             else:
                 return (None, pyaudio.paComplete)
@@ -290,11 +312,106 @@ class WhisperDictationApp(rumps.App):
         if hasattr(self, 'recording_thread'):
             self.recording_thread.join()
 
+        if self._live_mode:
+            # _stream_feed_loop (already running on the mlx worker) notices
+            # self.recording is now False, drains any queued audio, does a final
+            # reconciliation pass, and sets the status itself when it's done.
+            self.status_item.title = "Status: Finishing..."
+            return
+
         self.title = "🎙️ (Transcribing)"
         self.status_item.title = "Status: Transcribing..."
         logger.info("Recording stopped. Transcribing...")
 
         self.mlx_executor.submit(self.process_recording)
+
+    def _apply_stream_result(self, stream):
+        """Type the delta between what's on screen and the streaming decoder's
+        current state.
+
+        stream.finalized_tokens is only ever grown via .extend() (parakeet_mlx
+        never rewrites or drops earlier entries), so text built from it is
+        provably append-only — safe to type once and never touch again. Only
+        stream.draft_tokens (the small unconfirmed tail, replaced wholesale
+        each update) is backspaced and retyped. An earlier version diffed the
+        combined text directly, which broke when the decoder revised
+        something near the START of the utterance (e.g. capitalizing the
+        first word once more context arrived): the common-prefix comparison
+        found no match from character 0 and backspaced the entire sentence.
+
+        Deliberately not stripping the leading space each new recording
+        session naturally starts with (SentencePiece tokens carry it): that
+        space is what separates this dictation burst from whatever you
+        dictated right before it. The only cost is a single leading space if
+        this is the very first thing typed into an empty field.
+        """
+        finalized_text = "".join(t.text for t in stream.finalized_tokens)
+        draft_text = "".join(t.text for t in stream.draft_tokens)
+
+        if self._typed_draft:
+            for _ in range(len(self._typed_draft)):
+                self.keyboard_controller.press(keyboard.Key.backspace)
+                self.keyboard_controller.release(keyboard.Key.backspace)
+
+        if len(finalized_text) > len(self._typed_finalized):
+            self.keyboard_controller.type(finalized_text[len(self._typed_finalized):])
+            self._typed_finalized = finalized_text
+
+        if draft_text:
+            self.keyboard_controller.type(draft_text)
+        self._typed_draft = draft_text
+
+    def _stream_feed_loop(self):
+        """Runs on the persistent mlx_executor worker for the whole recording:
+        pulls raw mic chunks off self._stream_queue, batches ~0.5s at a time
+        into the MLX streaming decoder, and types the delta after each update."""
+        import mlx.core as mx
+
+        self._typed_finalized = ""
+        self._typed_draft = ""
+        batch = bytearray()
+        # 0.5s batches: each add_audio call costs ~300ms of fixed overhead almost
+        # regardless of chunk size or depth (measured), so small batches waste most
+        # of their time on that overhead instead of audio. 0.5s keeps real-time
+        # margin (~0.67x) comfortable while still feeling live.
+        batch_target_bytes = int(0.5 * self.rate) * 2  # ~0.5s of int16 mono PCM
+
+        try:
+            # depth=24 (the model's full encoder layer count) costs about the same
+            # as depth=2 here (the ~300ms/call overhead above dominates either way),
+            # so there's no real reason not to max it out: the cache then matches a
+            # true non-streaming forward pass exactly instead of approximating it.
+            # right_context=32 frames (~2.5s lookahead) gives the decoder more future
+            # audio before locking a word in. Tuned this way after low-latency
+            # defaults (depth=2, right=8) produced visibly worse transcriptions and
+            # frequent tail rewrites.
+            with self.model.transcribe_stream(context_size=(256, 32), depth=24) as stream:
+                while True:
+                    try:
+                        batch += self._stream_queue.get(timeout=0.05)
+                    except queue.Empty:
+                        pass
+
+                    stopped = not self.recording and self._stream_queue.empty()
+                    if batch and (len(batch) >= batch_target_bytes or stopped):
+                        pcm16 = np.frombuffer(bytes(batch), dtype=np.int16)
+                        audio = mx.array(pcm16.astype(np.float32) / 32768.0)
+                        stream.add_audio(audio)
+                        self._apply_stream_result(stream)
+                        batch = bytearray()
+
+                    if stopped and not batch:
+                        break
+        except Exception as e:
+            logger.error(f"Error during live transcription: {e}")
+            self.status_item.title = "Status: Error during live transcription"
+        else:
+            preview = (self._typed_finalized + self._typed_draft)[:30]
+            self.status_item.title = (
+                f"Status: Transcribed: {preview}..." if preview else "Status: No speech detected"
+            )
+        finally:
+            self.title = "🎙️"
 
     def process_recording(self):
         try:
