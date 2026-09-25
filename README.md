@@ -1,7 +1,7 @@
 # Parakeet Dictation (macOS)
 
-Local, fast, privacy-friendly dictation for macOS using NVIDIA Parakeet (MLX on Apple Silicon) with a push-to-talk hotkey.  
-Bonus: speak commands to **rewrite selected text** via Qwen.
+Local, fast, privacy-friendly dictation for macOS using NVIDIA Parakeet (MLX on Apple Silicon) with a push-to-talk hotkey. Words appear as you talk, not just after you let go.  
+Bonus: speak commands to **rewrite selected text** via Qwen (opt-in).
 
 ---
 
@@ -15,7 +15,7 @@ Bonus: speak commands to **rewrite selected text** via Qwen.
 - [Configuration](#configuration)
 - [Usage](#usage)
   - [Push-to-talk dictation](#push-to-talk-dictation)
-  - [Voice-driven text editing (Claude via Bedrock)](#voice-driven-text-editing-claude-via-bedrock)
+  - [Voice-driven text editing (Qwen via MLX)](#voice-driven-text-editing-qwen-via-mlx)
   - [Menu bar controls](#menu-bar-controls)
 - [Permissions (macOS)](#permissions-macos)
 - [Run in the background](#run-in-the-background)
@@ -34,17 +34,18 @@ Parakeet Dictation gives you **on-device** speech-to-text on macOS with a **sing
 
 - **Private**: Audio is processed locally on your Mac.
 - **Fast**: Parakeet models are optimized and run great on Apple Silicon via MLX.
-- **Practical**: Dictate into *any* app, or select text and **say how to transform it** (“make this more professional”, “translate to Spanish”, etc.)-the app rewrites it via AWS Bedrock and pastes it in place.
+- **Practical**: Dictate into *any* app, or select text and **say how to transform it** (“make this more professional”, “translate to Spanish”, etc.) — the app rewrites it via a local Qwen2.5 model and pastes it in place.
 
 ---
 
 ## Features
 
 - 🖥️ **Menu bar** app (stays out of your way)
-- 🎙️ **Push-to-talk**: Press the **Globe / Fn** key to start recording, press again to transcribe & paste
+- 🎙️ **Push-to-talk**: hold **right Option** to record, release to stop — left Option is left alone so its normal shortcuts still work
+- ⚡ **Live streaming dictation**: words are typed as you talk (via `parakeet-mlx`'s streaming decoder), not only after you release the key
 - ⚡ **Local ASR** with **NVIDIA Parakeet** (Apple Silicon via MLX)
-- ⌨️ **Auto-paste at cursor** in the foreground app
-- ✨ **Voice-driven text editing** (optional): when text is selected, your speech is treated as an instruction and the selection is replaced with the result (via AWS Bedrock → Claude)
+- ⌨️ **Types directly at the cursor** in the foreground app
+- ✨ **Voice-driven text editing** (optional, off by default — see `PARAKEET_ENABLE_LLM`): when text is selected, your speech is treated as an instruction and the selection is replaced with the result (via local Qwen2.5 on MLX)
 - ✅ Clear **recording status** via the menu bar icon
 - 🧰 Simple **background mode** (no UI) for power users
 
@@ -58,11 +59,12 @@ TBD
 
 ## Requirements
 
-- **macOS 12+** (Apple Silicon recommended for speed)
-- **Python 3.10+**
+- **Apple Silicon Mac** (MLX requires it)
+- **Python 3.12** (pinned via `requires-python` in `pyproject.toml`)
 - **Microphone**
-- **Accessibility permission** (to paste text programmatically)
+- **Accessibility + Input Monitoring permission** (for the global push-to-talk key and typing into other apps)
 - **PortAudio** (for PyAudio)
+- [**uv**](https://docs.astral.sh/uv/) (recommended — manages its own isolated Python and venv, no manual `venv`/`activate` needed)
 
 ---
 
@@ -71,19 +73,44 @@ TBD
 ### 1. Install system deps
 
 ```bash
-brew install portaudio ffmpeg
+brew install portaudio
 ```
 
-### 2. Clone & install Python deps
+### 2. Install the app
+
+The simplest path — installs as an isolated CLI tool (`uv` fetches its own Python 3.12, no system Python or manual venv needed):
 
 ```bash
-git clone https://github.com/osadalakmal/parakeet-dictation.git
-cd parakeet-dictation
-
-uv venv -p 3.12.5
-source .venv/bin/activate
-uv add -r requirements.txt
+uv tool install git+https://github.com/trotha01/parakeet-dictation.git
 ```
+
+To hack on the source instead (what this fork's own development uses):
+
+```bash
+git clone https://github.com/trotha01/parakeet-dictation.git
+cd parakeet-dictation
+uv tool install --editable .
+```
+
+With `--editable`, edits to `src/parakeet_dictation/main.py` take effect on the next launch — no reinstall needed.
+
+Either way, this installs a `parakeet-dictation` executable (check with `which parakeet-dictation`).
+
+---
+
+## Configuration
+
+All optional, set as environment variables before launching:
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `PARAKEET_MODEL` | `mlx-community/parakeet-tdt-0.6b-v3` | ASR model to use, any `parakeet-mlx`-compatible MLX Hub repo |
+| `PARAKEET_ENABLE_LLM` | unset (off) | Set to `1` to load Qwen2.5-1.5B and enable voice-driven text editing. Off by default: loading it downloads/holds a second model in memory for a feature most launches won't use |
+| `PARAKEET_LLM_MODEL` | `mlx-community/Qwen2.5-1.5B-Instruct-4bit` | Edit-instruction model, only relevant with `PARAKEET_ENABLE_LLM=1` |
+| `PARAKEET_LLM_MAX_TOKENS` | `192` | Max tokens for an edit rewrite |
+| `PARAKEET_LLM_TEMP` | `0.2` | Edit rewrite temperature |
+| `PARAKEET_LLM_TOP_P` | `0.9` | Edit rewrite top-p |
+| `PARAKEET_LOG` | `warning` | Set to `info` or `debug` for verbose logging — `info` includes per-chunk audio level (RMS), auto-gain applied, and live token counts, useful for diagnosing why a session came out blank or garbled |
 
 ---
 
@@ -92,20 +119,22 @@ uv add -r requirements.txt
 ### Push-to-talk dictation
 
 1. Launch the app (see Development or Background sections below).
-2. Press the **Ctrl+Alt+A** (🌐) / Function key to start recording.
-3. Speak normally.
-4. Release the keys again to stop. The app will transcribe and paste the text at your current cursor position.
+2. Click into any text field, then hold **right Option** to start recording. (Left Option is deliberately ignored, so its usual shortcuts — e.g. option-drag, special characters — keep working everywhere else.)
+3. Speak normally. Words are typed as you go, not only at the end.
+4. Release right Option to stop. Any words still being refined by the decoder get one last reconciliation pass.
 
 ### Voice-driven text editing (Qwen via MLX)
 
+Requires `PARAKEET_ENABLE_LLM=1` (see [Configuration](#configuration)) — off by default.
+
 1. Select text in any app.
-2. Press the Globe / Fn key and speak an instruction, e.g.:
+2. Hold right Option and speak an instruction, e.g.:
   - “Fix the grammar”
   - “Summarize this”
   - “Translate to Spanish”
-3. Press the key again to stop. The selected text will be replaced with the edited version.
+3. Release right Option. The selected text is replaced with the edited version. (This path is batch, not live-typed — an edit instruction needs to be heard in full before it can be applied.)
 
-When no text is selected, your speech is treated as dictation and the text is inserted normally.
+When no text is selected, your speech is always treated as plain dictation, whether or not the LLM edit feature is enabled.
 
 ### Menu bar controls
 
@@ -117,57 +146,67 @@ When no text is selected, your speech is treated as dictation and the text is in
 
 ## Permissions (macOS)
 
-- **Microphone**: System Settings → Privacy & Security → Microphone → allow your Terminal/app
-- **Accessibility**: System Settings → Privacy & Security → Accessibility → allow your Terminal/app
+Grant all three to whatever app actually launches the process — if you run it from a terminal, that's your terminal app (iTerm, Terminal.app, etc.), not `parakeet-dictation` itself:
 
-Without Accessibility permission, the app cannot paste text for you.
+- **Accessibility**: System Settings → Privacy & Security → Accessibility → allow your terminal app
+- **Input Monitoring**: System Settings → Privacy & Security → Input Monitoring → allow your terminal app — without this, the global right-Option listener silently never fires
+- **Microphone**: System Settings → Privacy & Security → Microphone → allow your terminal app — without this, recording *looks* like it's working (the menu bar shows "Recording...", no error appears) but every session captures silence and ends with "No speech detected"
+
+After granting any of these, fully quit and relaunch the app — permission changes don't apply to an already-running process.
 
 ---
 
 ## Run in the background
 
 ```bash
-nohup PYTHONPATH=src python -m parakeet_dictation.main >/dev/null 2>&1 & disown
+nohup parakeet-dictation >/tmp/parakeet-dictation.log 2>&1 & disown
 ```
 
 Stop it later:
 
 ```bash
-ps aux | grep 'parakeet_dictation'
-kill -9 <PID>
+pkill -f parakeet-dictation
 ```
 
 ---
 
 ## Troubleshooting
 
-- No audio: ensure `portaudio` is installed
-- Nothing pastes: check Accessibility permissions
-- High CPU usage: first run warms up the model
+- No audio at all: ensure `portaudio` is installed
+- Hotkey does nothing: check Accessibility + Input Monitoring permissions, and that you fully relaunched after granting them
+- Nothing types, but no error shown either: almost always missing Microphone permission (see [Permissions](#permissions-macos)) — set `PARAKEET_LOG=info` and try again; a session that captured real speech logs its audio level (`chunk: rms=...`) per chunk, so `rms=0.0` on every line confirms the mic isn't reaching the app
+- Launch hangs indefinitely with no log output past the startup warnings: usually a stalled Hugging Face Hub network check, not a real hang — killing and relaunching with `HF_HUB_OFFLINE=1` (once the model is already cached locally) skips it
+- High CPU / slow first response: the first recording after launch warms up the model; later ones are faster
+- An extra word appears at the end of some dictations: expected occasionally — the chunk(s) right after you release the key are more likely to be trailing breath/noise than speech, and very quiet audio there is deliberately not auto-gained as aggressively as mid-utterance for this reason (see the comments around `silence_threshold` in `main.py` if tuning further)
 
 ---
 
 ## Development
 
+Install editable (see [Installation](#installation)), then edit `src/parakeet_dictation/main.py` directly — changes take effect on the next launch, no reinstall step:
+
 ```bash
-source .venv/bin/activate
-PYTHONPATH=src PARAKEET_LOG=debug python -m parakeet_dictation.main
+pkill -f parakeet-dictation
+PARAKEET_LOG=debug parakeet-dictation
 ```
 
 - Menu bar UI via `rumps`
 - Hotkey via `pynput`
 - Audio capture via `pyaudio`
-- ASR via `parakeet-mlx`
-- AI powered edits via Qwen
+- Streaming ASR via `parakeet-mlx`'s `transcribe_stream` (see `_stream_feed_loop` / `_apply_stream_result` in `main.py`)
+- AI powered edits via Qwen2.5 on MLX (`mlx-lm`)
+
+**A note on threading with MLX**: `load_model` and every transcription call run on one persistent `concurrent.futures.ThreadPoolExecutor(max_workers=1)`, never on ad-hoc `threading.Thread`s. MLX ties lazily-evaluated arrays to the stream of the thread that created them — loading the model on one thread and transcribing on a fresh thread each time raises `RuntimeError: There is no Stream(cpu, 1) in current thread.` If you add a new code path that calls into the model, route it through `self.mlx_executor`, not a new thread.
 
 ---
 
 ## Roadmap
 
+- ~~Streaming/partial results~~ — done
 - Preferences UI (Status bar is pretty finicky)
-- Streaming/partial results (It seems nice to start pasting things soon as we can)
 - macOS app packaging (Non techie folks can use this as well)
-- Latency/quality settings
+- Real VAD instead of an RMS-threshold heuristic for the post-release trailing-audio cutoff
+- Configurable streaming latency/accuracy tradeoff (currently a fixed tuning in `main.py`)
 
 ---
 
