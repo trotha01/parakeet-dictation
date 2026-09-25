@@ -45,6 +45,10 @@ def signal_handler(signum, frame):  # FIXED: accept (signum, frame)
 signal.signal(signal.SIGINT, signal_handler)
 signal.signal(signal.SIGTERM, signal_handler)
 
+# Sentinel put onto a recording's own stream queue to mark "no more audio is
+# coming for this session" — see start_recording / stop_recording / _stream_feed_loop.
+_STREAM_STOP = object()
+
 class WhisperDictationApp(rumps.App):
     def __init__(self):
         super(WhisperDictationApp, self).__init__("🎙️", quit_button=rumps.MenuItem("Quit"))
@@ -268,7 +272,13 @@ class WhisperDictationApp(rumps.App):
         self.recording_thread.start()
 
         if self._live_mode:
-            self.mlx_executor.submit(self._stream_feed_loop)
+            # Pass this session's queue explicitly rather than letting the loop
+            # read self._stream_queue on every iteration: if you start a new
+            # recording again before this session's loop has finished draining
+            # (mlx_executor has one worker, so a slow drain queues the next
+            # session behind it), self._stream_queue gets reassigned to the new
+            # session's queue out from under the still-running old loop.
+            self.mlx_executor.submit(self._stream_feed_loop, self._stream_queue)
 
     def _record_audio_callback_loop(self):
         def _cb(in_data, frame_count, time_info, status_flags):
@@ -313,9 +323,13 @@ class WhisperDictationApp(rumps.App):
             self.recording_thread.join()
 
         if self._live_mode:
-            # _stream_feed_loop (already running on the mlx worker) notices
-            # self.recording is now False, drains any queued audio, does a final
-            # reconciliation pass, and sets the status itself when it's done.
+            # self.recording_thread.join() above guarantees every real audio chunk
+            # for this session is already queued, so it's safe to enqueue the stop
+            # marker now — the queue's FIFO order keeps it after all of them.
+            # _stream_feed_loop (already running on the mlx worker, possibly still
+            # behind a previous session's queued work) drains up through this
+            # marker, does a final reconciliation pass, and sets the status itself.
+            self._stream_queue.put(_STREAM_STOP)
             self.status_item.title = "Status: Finishing..."
             return
 
@@ -344,9 +358,20 @@ class WhisperDictationApp(rumps.App):
         space is what separates this dictation burst from whatever you
         dictated right before it. The only cost is a single leading space if
         this is the very first thing typed into an empty field.
+
+        Also never lets the total displayed length shrink. draft_tokens can
+        legitimately get shorter between updates — most visibly right at
+        release, when the last sliver of trailing audio (silence, a breath)
+        enters the decoder's local-attention window and it reconsiders
+        whatever was still in draft, sometimes down to nothing. Once you've
+        stopped talking, no further audio is ever coming to justify that
+        revision, so the last good hypothesis is kept on screen instead.
         """
         finalized_text = "".join(t.text for t in stream.finalized_tokens)
         draft_text = "".join(t.text for t in stream.draft_tokens)
+
+        if len(finalized_text) + len(draft_text) < len(self._typed_finalized) + len(self._typed_draft):
+            return
 
         if self._typed_draft:
             for _ in range(len(self._typed_draft)):
@@ -361,15 +386,24 @@ class WhisperDictationApp(rumps.App):
             self.keyboard_controller.type(draft_text)
         self._typed_draft = draft_text
 
-    def _stream_feed_loop(self):
+    def _stream_feed_loop(self, stream_queue):
         """Runs on the persistent mlx_executor worker for the whole recording:
-        pulls raw mic chunks off self._stream_queue, batches ~0.5s at a time
-        into the MLX streaming decoder, and types the delta after each update."""
+        pulls raw mic chunks off stream_queue, batches ~0.5s at a time into the
+        MLX streaming decoder, and types the delta after each update.
+
+        stream_queue is passed explicitly (not read as self._stream_queue) and
+        termination is driven by the _STREAM_STOP marker stop_recording puts on
+        it (not by polling self.recording): mlx_executor has one worker, so if a
+        new recording starts before this session's queue has fully drained, a
+        shared self.recording/self._stream_queue would get reassigned to the new
+        session out from under this still-running loop.
+        """
         import mlx.core as mx
 
         self._typed_finalized = ""
         self._typed_draft = ""
         batch = bytearray()
+        got_stop = False
         # 0.5s batches: each add_audio call costs ~300ms of fixed overhead almost
         # regardless of chunk size or depth (measured), so small batches waste most
         # of their time on that overhead instead of audio. 0.5s keeps real-time
@@ -377,25 +411,49 @@ class WhisperDictationApp(rumps.App):
         batch_target_bytes = int(0.5 * self.rate) * 2  # ~0.5s of int16 mono PCM
 
         try:
-            # depth=24 (the model's full encoder layer count) costs about the same
-            # as depth=2 here (the ~300ms/call overhead above dominates either way),
-            # so there's no real reason not to max it out: the cache then matches a
-            # true non-streaming forward pass exactly instead of approximating it.
-            # right_context=32 frames (~2.5s lookahead) gives the decoder more future
-            # audio before locking a word in. Tuned this way after low-latency
-            # defaults (depth=2, right=8) produced visibly worse transcriptions and
-            # frequent tail rewrites.
-            with self.model.transcribe_stream(context_size=(256, 32), depth=24) as stream:
+            # right_context and depth both cost about the same to run (the
+            # ~300ms/call overhead above dominates either way, measured), so
+            # there's no real reason not to raise them for accuracy — EXCEPT
+            # that parakeet_mlx computes how much audio must arrive before
+            # anything finalizes as drop_size = right_context * depth, not
+            # either one alone. A first pass at (right=32, depth=24) — maxing
+            # depth out since it looked free — gave drop_size = 768 frames,
+            # ~61 seconds: nothing finalizes during any normal dictation, so
+            # the whole utterance stays in the volatile draft state the
+            # entire time, fully exposed to _apply_stream_result's shrink
+            # guard above kicking in right at release. Kept right_context
+            # (drives the actual per-frame local-attention lookahead, i.e.
+            # real accuracy) and dropped depth back down, landing on a
+            # drop_size of ~5s — long enough to rarely matter for a typical
+            # dictation length, short enough that longer utterances do get
+            # real, permanently-locked-in finalized text along the way.
+            with self.model.transcribe_stream(context_size=(256, 16), depth=4) as stream:
                 while True:
                     try:
-                        batch += self._stream_queue.get(timeout=0.05)
+                        item = stream_queue.get(timeout=0.05)
+                        if item is _STREAM_STOP:
+                            got_stop = True
+                        else:
+                            batch += item
                     except queue.Empty:
                         pass
 
-                    stopped = not self.recording and self._stream_queue.empty()
+                    stopped = got_stop and stream_queue.empty()
                     if batch and (len(batch) >= batch_target_bytes or stopped):
                         pcm16 = np.frombuffer(bytes(batch), dtype=np.int16)
-                        audio = mx.array(pcm16.astype(np.float32) / 32768.0)
+                        audio_np = pcm16.astype(np.float32) / 32768.0
+                        # Simple per-chunk auto-gain: a whisper (or just talking quietly)
+                        # can sit at a tiny fraction of the mic's usable range, and the
+                        # model may register that as near-silence rather than speech (a
+                        # quiet enough clip decodes to no tokens at all). Boost toward a
+                        # target peak so quiet chunks get a fair shot; capped so we don't
+                        # blow up an actually-silent chunk's noise floor.
+                        peak = float(np.abs(audio_np).max())
+                        if peak > 1e-4:
+                            gain = min(0.7 / peak, 8.0)
+                            if gain > 1.0:
+                                audio_np = audio_np * gain
+                        audio = mx.array(audio_np)
                         stream.add_audio(audio)
                         self._apply_stream_result(stream)
                         batch = bytearray()
