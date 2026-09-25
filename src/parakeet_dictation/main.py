@@ -404,30 +404,30 @@ class WhisperDictationApp(rumps.App):
         self._typed_draft = ""
         batch = bytearray()
         got_stop = False
-        # 0.5s batches: each add_audio call costs ~300ms of fixed overhead almost
-        # regardless of chunk size or depth (measured), so small batches waste most
-        # of their time on that overhead instead of audio. 0.5s keeps real-time
-        # margin (~0.67x) comfortable while still feeling live.
-        batch_target_bytes = int(0.5 * self.rate) * 2  # ~0.5s of int16 mono PCM
+        # 1.0s batches: each add_audio call costs a large fixed overhead almost
+        # regardless of chunk size or depth (measured), so bigger batches spend
+        # more of that cost on actual audio. Traded some of the "live" feel for
+        # accuracy on request — text now first appears roughly ~1.4s after you
+        # start talking instead of ~0.8s.
+        batch_target_bytes = int(1.0 * self.rate) * 2  # ~1.0s of int16 mono PCM
 
         try:
-            # right_context and depth both cost about the same to run (the
-            # ~300ms/call overhead above dominates either way, measured), so
+            # right_context and depth both cost about the same to run (a large
+            # fixed per-call overhead dominates either way, measured), so
             # there's no real reason not to raise them for accuracy — EXCEPT
             # that parakeet_mlx computes how much audio must arrive before
             # anything finalizes as drop_size = right_context * depth, not
-            # either one alone. A first pass at (right=32, depth=24) — maxing
-            # depth out since it looked free — gave drop_size = 768 frames,
-            # ~61 seconds: nothing finalizes during any normal dictation, so
-            # the whole utterance stays in the volatile draft state the
-            # entire time, fully exposed to _apply_stream_result's shrink
-            # guard above kicking in right at release. Kept right_context
-            # (drives the actual per-frame local-attention lookahead, i.e.
-            # real accuracy) and dropped depth back down, landing on a
-            # drop_size of ~5s — long enough to rarely matter for a typical
-            # dictation length, short enough that longer utterances do get
-            # real, permanently-locked-in finalized text along the way.
-            with self.model.transcribe_stream(context_size=(256, 16), depth=4) as stream:
+            # either one alone. (256, 64)/depth=12 gives drop_size = 768
+            # frames, ~61s: nothing finalizes during any normal dictation, so
+            # the whole utterance stays in the volatile draft state the entire
+            # time. That was the problem the first time these numbers came up
+            # (before _apply_stream_result had its shrink guard, a session
+            # entirely in draft state could get wiped at release) — now that
+            # the guard exists, "never finalizes" just means "always eligible
+            # for a real correction," which is what more accuracy needs. Went
+            # higher on both knobs than the safer (16, 4) tuning specifically
+            # because Trevor asked to trade latency for accuracy.
+            with self.model.transcribe_stream(context_size=(256, 64), depth=12) as stream:
                 while True:
                     try:
                         item = stream_queue.get(timeout=0.05)
@@ -451,12 +451,26 @@ class WhisperDictationApp(rumps.App):
                         # talking" — clipped afterward since a high gain on a window with
                         # one louder moment can otherwise push samples past full scale.
                         rms = float(np.sqrt(np.mean(np.square(audio_np)))) if audio_np.size else 0.0
-                        if rms > 5e-4:  # skip near-silence — don't amplify pure noise floor
-                            gain = min(0.05 / rms, 30.0)
-                            if gain > 1.0:
-                                audio_np = np.clip(audio_np * gain, -1.0, 1.0)
+                        # The chunk(s) flushed right after you release the key are
+                        # disproportionately likely to be trailing silence, breath, or
+                        # the click of releasing the key rather than real speech — you've
+                        # already signaled "done talking." Auto-gain would otherwise boost
+                        # that noise floor into something the model can mistake for a
+                        # mumbled extra word (observed: token count growing in exactly
+                        # these low-RMS post-release chunks), so this window needs a
+                        # meaningfully louder signal before it's treated as worth boosting.
+                        silence_threshold = 0.003 if stopped else 5e-4
+                        gain_applied = 1.0
+                        if rms > silence_threshold:
+                            gain_applied = min(0.05 / rms, 30.0)
+                            if gain_applied > 1.0:
+                                audio_np = np.clip(audio_np * gain_applied, -1.0, 1.0)
                         audio = mx.array(audio_np)
                         stream.add_audio(audio)
+                        logger.info(
+                            f"chunk: rms={rms:.5f} gain={gain_applied:.1f} "
+                            f"finalized={len(stream.finalized_tokens)} draft={len(stream.draft_tokens)}"
+                        )
                         self._apply_stream_result(stream)
                         batch = bytearray()
 
@@ -467,6 +481,7 @@ class WhisperDictationApp(rumps.App):
             self.status_item.title = "Status: Error during live transcription"
         else:
             preview = (self._typed_finalized + self._typed_draft)[:30]
+            logger.info(f"Session ended. Typed: {preview!r}")
             self.status_item.title = (
                 f"Status: Transcribed: {preview}..." if preview else "Status: No speech detected"
             )
