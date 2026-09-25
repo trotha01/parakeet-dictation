@@ -50,6 +50,12 @@ signal.signal(signal.SIGTERM, signal_handler)
 # coming for this session" — see start_recording / stop_recording / _stream_feed_loop.
 _STREAM_STOP = object()
 
+# Auto-stop a held-open recording if nothing at or above this RMS arrives for
+# this long — guards against a missed key-up event (or a mic that's gone
+# silent) leaving the recording, and the hotkey, stuck open indefinitely.
+SILENCE_TIMEOUT_SECS = float(os.getenv("PARAKEET_SILENCE_TIMEOUT_SECS", "15"))
+_SILENCE_RMS_THRESHOLD = 5e-4  # same floor _stream_feed_loop uses for auto-gain
+
 LLM_MENU_TITLE = "Enable Text Editing (Qwen)"
 
 
@@ -233,7 +239,7 @@ class WhisperDictationApp(rumps.App):
         self.setup_global_monitor()
 
         logger.info("Started WhisperDictation app. Look for 🎙️ in your menu bar.")
-        logger.info("Press and HOLD Ctrl + Alt + A to record. Release to transcribe.")
+        logger.info(f"Press and HOLD {_hotkey_display_name(self.settings['hotkey'])} to record. Release to transcribe.")
         logger.info("Press Ctrl+C to quit the application.")
         logger.info("If hotkeys don’t fire: System Settings → Privacy & Security → Accessibility + Input Monitoring")
 
@@ -370,6 +376,16 @@ class WhisperDictationApp(rumps.App):
             self._run_modifier_only_listener(hotkey["modifiers"])
 
     def _run_modifier_only_listener(self, modifier_names):
+        # on_press/on_release below MUST return almost instantly: pynput's macOS
+        # backend runs them synchronously inside a CGEventTap callback, and the
+        # WindowServer blocks system-wide keyboard delivery until that callback
+        # returns. start_recording/stop_recording can block for a while (thread
+        # joins, and — when text-editing mode is on — a synthetic Cmd+C plus
+        # ~0.3s of sleeps to read the selection) and that synthetic keystroke is
+        # itself a re-entrant CGEventPost from inside a live tap callback, which
+        # is its own deadlock hazard. Once observed to freeze the keyboard
+        # system-wide, requiring a hard shutdown. Always hand off to a thread
+        # here instead of calling them directly.
         required = {_name_to_key(name) for name in modifier_names}
         held = set()
 
@@ -379,7 +395,7 @@ class WhisperDictationApp(rumps.App):
                 if held == required and not self.recording and not self.is_recording_with_hotkey:
                     self.is_recording_with_hotkey = True
                     logger.info(f"STARTING recording via {' + '.join(modifier_names)}")
-                    self.start_recording()
+                    threading.Thread(target=self.start_recording, daemon=True).start()
 
         def on_release(key):
             if key in required:
@@ -387,7 +403,7 @@ class WhisperDictationApp(rumps.App):
                 if self.is_recording_with_hotkey and self.recording:
                     logger.info(f"STOPPING recording via {' + '.join(modifier_names)} release")
                     self.is_recording_with_hotkey = False
-                    self.stop_recording()
+                    threading.Thread(target=self.stop_recording, daemon=True).start()
 
         listener = keyboard.Listener(on_press=on_press, on_release=on_release)
         self._active_hotkey_stoppers = [listener.stop]
@@ -402,7 +418,7 @@ class WhisperDictationApp(rumps.App):
             if not self.recording and not self.is_recording_with_hotkey:
                 self.is_recording_with_hotkey = True
                 logger.info(f"STARTING recording via {chord_str}")
-                self.start_recording()
+                threading.Thread(target=self.start_recording, daemon=True).start()
 
         # Release-detection watches both the generic (left/either) and the
         # right-specific form of every modifier family involved, since a real
@@ -418,7 +434,7 @@ class WhisperDictationApp(rumps.App):
             if key in release_keys and self.is_recording_with_hotkey and self.recording:
                 logger.info(f"STOPPING recording via {chord_str} release")
                 self.is_recording_with_hotkey = False
-                self.stop_recording()
+                threading.Thread(target=self.stop_recording, daemon=True).start()
 
         hotkeys = keyboard.GlobalHotKeys({chord_str: start})
         release_listener = keyboard.Listener(on_release=on_release)
@@ -564,6 +580,7 @@ class WhisperDictationApp(rumps.App):
 
         self.frames = []
         self.recording = True
+        self._last_sound_time = time.time()
         self.title = "🎙️ (Recording)"
         self.status_item.title = "Status: Recording..."
         logger.info("Recording started. Speak now...")
@@ -586,6 +603,7 @@ class WhisperDictationApp(rumps.App):
         # Use a callback stream for near-instant stop
         self.recording_thread = threading.Thread(target=self._record_audio_callback_loop, daemon=True)
         self.recording_thread.start()
+        threading.Thread(target=self._silence_watchdog, daemon=True).start()
 
         if self._live_mode:
             # Pass this session's queue explicitly rather than letting the loop
@@ -603,6 +621,14 @@ class WhisperDictationApp(rumps.App):
                 self.frames.append(in_data)
                 if self._live_mode:
                     self._stream_queue.put(in_data)
+                # Cheap RMS check to feed the silence watchdog. Runs on
+                # PortAudio's own realtime callback thread, so this has to
+                # stay fast and non-blocking — no logging, no locks.
+                pcm16 = np.frombuffer(in_data, dtype=np.int16)
+                if pcm16.size:
+                    rms = float(np.sqrt(np.mean(np.square(pcm16.astype(np.float32) / 32768.0))))
+                    if rms > _SILENCE_RMS_THRESHOLD:
+                        self._last_sound_time = time.time()
                 return (None, pyaudio.paContinue)
             else:
                 return (None, pyaudio.paComplete)
@@ -631,12 +657,31 @@ class WhisperDictationApp(rumps.App):
             except Exception:
                 pass
 
+    def _silence_watchdog(self):
+        """Auto-stops a recording session that's gone SILENCE_TIMEOUT_SECS
+        without hearing anything above _SILENCE_RMS_THRESHOLD — e.g. a
+        missed key-up event, or the mic silently failing, leaving the
+        hotkey stuck "held" forever. Runs on its own thread (never the
+        hotkey listener's tap-callback thread or recording_thread itself,
+        which stop_recording's join() would deadlock against), so it's
+        safe for it to call stop_recording() directly.
+        """
+        session = self.recording_thread
+        while self.recording and self.recording_thread is session:
+            if time.time() - self._last_sound_time > SILENCE_TIMEOUT_SECS:
+                logger.warning(f"No audio detected for {SILENCE_TIMEOUT_SECS:.0f}s — auto-stopping recording")
+                self.stop_recording()
+                return
+            time.sleep(0.5)
+
     def stop_recording(self):
         if not self.recording:
             return
         self.recording = False
         if hasattr(self, 'recording_thread'):
-            self.recording_thread.join()
+            self.recording_thread.join(timeout=5)
+            if self.recording_thread.is_alive():
+                logger.error("recording_thread didn't stop within 5s (stuck closing the audio stream?) — continuing without waiting further")
 
         if self._live_mode:
             # self.recording_thread.join() above guarantees every real audio chunk
@@ -925,7 +970,7 @@ class WhisperDictationApp(rumps.App):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Parakeet Dictation: Speech-to-text and local LLM text editing for macOS.\n\nINSTRUCTIONS:\n\n- After launching, look for the 🎙️ icon in your macOS menu bar.\n- Press and HOLD Ctrl + Alt + A to start dictation. Release to transcribe.\n- If you select text before dictating, your spoken command will be used as an edit instruction for the selected text (requires local LLM).\n- If hotkeys do not work, check System Settings → Privacy & Security → Accessibility and Input Monitoring.\n- To quit, use the menu bar or press Ctrl+C in the terminal.\n- For more info, see: https://github.com/osadalakmal/parakeet-dictation\n\nOPTIONS:"
+        description=f"Parakeet Dictation: Speech-to-text and local LLM text editing for macOS.\n\nINSTRUCTIONS:\n\n- After launching, look for the 🎙️ icon in your macOS menu bar.\n- Press and HOLD {_hotkey_display_name(DEFAULT_HOTKEY)} to start dictation (configurable from the menu bar). Release to transcribe.\n- If you select text before dictating, your spoken command will be used as an edit instruction for the selected text (requires local LLM).\n- If hotkeys do not work, check System Settings → Privacy & Security → Accessibility and Input Monitoring.\n- To quit, use the menu bar or press Ctrl+C in the terminal.\n- For more info, see: https://github.com/osadalakmal/parakeet-dictation\n\nOPTIONS:"
     )
     parser.add_argument('--version', action='version', version='parakeet-dictation 0.1.0')
     args = parser.parse_args()
