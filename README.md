@@ -106,7 +106,7 @@ All three options install a `parakeet-dictation` executable (check with `which p
 
 ## Configuration
 
-All optional, set as environment variables before launching:
+All optional, set as environment variables before launching. `PARAKEET_ENABLE_LLM` and `PARAKEET_LOG` are also available live from the menu bar (see [Menu bar controls](#menu-bar-controls)) — the menu is where those two actually persist across relaunches; the env vars just seed that setting for whichever launch sets them.
 
 | Variable | Default | Purpose |
 |---|---|---|
@@ -144,9 +144,14 @@ When no text is selected, your speech is always treated as plain dictation, whet
 
 ### Menu bar controls
 
-- Start/Stop Listening - toggles recording
-- Settings - (future) configuration UI
-- Quit - exits the app
+- **Start/Stop Recording** — toggles recording (same as holding right Option)
+- **Accuracy** — Fast / Balanced / Accurate, the presets from [Configuration](#configuration); takes effect on your next recording
+- **Enable Text Editing (Qwen)** — same as `PARAKEET_ENABLE_LLM`, but live: toggling it on loads Qwen in the background on first use rather than requiring a restart. Shows "(downloads ~1GB)" until the model is actually cached
+- **Verbose Logging** — same as `PARAKEET_LOG=info`, toggled live
+- **Status: ...** — not clickable, just shows current state
+- **Quit** — exits the app
+
+All three settings persist across relaunches (`~/Library/Application Support/parakeet-dictation/settings.json`). The `PARAKEET_*` env vars still work too — they seed that setting for the launch they're set on, but the menu is what's saved.
 
 ---
 
@@ -209,10 +214,10 @@ PARAKEET_LOG=debug parakeet-dictation
 ## Roadmap
 
 - ~~Streaming/partial results~~ — done
-- Preferences UI (Status bar is pretty finicky)
+- ~~Preferences UI~~ — done, as menu bar items rather than a separate window (see [Menu bar controls](#menu-bar-controls)) — a real window is still possible later if the menu outgrows this
+- ~~Configurable streaming latency/accuracy tradeoff~~ — done, the Accuracy menu
 - macOS app packaging (Non techie folks can use this as well)
 - Real VAD instead of an RMS-threshold heuristic for the post-release trailing-audio cutoff
-- Configurable streaming latency/accuracy tradeoff (currently a fixed tuning in `main.py`)
 
 ---
 
