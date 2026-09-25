@@ -442,17 +442,19 @@ class WhisperDictationApp(rumps.App):
                     if batch and (len(batch) >= batch_target_bytes or stopped):
                         pcm16 = np.frombuffer(bytes(batch), dtype=np.int16)
                         audio_np = pcm16.astype(np.float32) / 32768.0
-                        # Simple per-chunk auto-gain: a whisper (or just talking quietly)
-                        # can sit at a tiny fraction of the mic's usable range, and the
-                        # model may register that as near-silence rather than speech (a
-                        # quiet enough clip decodes to no tokens at all). Boost toward a
-                        # target peak so quiet chunks get a fair shot; capped so we don't
-                        # blow up an actually-silent chunk's noise floor.
-                        peak = float(np.abs(audio_np).max())
-                        if peak > 1e-4:
-                            gain = min(0.7 / peak, 8.0)
+                        # Per-chunk auto-gain so quiet/whispered speech gets a fair shot
+                        # (a quiet enough clip otherwise decodes to no tokens at all).
+                        # RMS-based rather than peak-based: a single louder consonant or
+                        # a click in an otherwise-quiet window would cap a peak-based gain
+                        # far below what the rest of the (actually quiet) window needs.
+                        # Target RMS and cap picked for true whispers, not just "quiet
+                        # talking" — clipped afterward since a high gain on a window with
+                        # one louder moment can otherwise push samples past full scale.
+                        rms = float(np.sqrt(np.mean(np.square(audio_np)))) if audio_np.size else 0.0
+                        if rms > 5e-4:  # skip near-silence — don't amplify pure noise floor
+                            gain = min(0.05 / rms, 30.0)
                             if gain > 1.0:
-                                audio_np = audio_np * gain
+                                audio_np = np.clip(audio_np * gain, -1.0, 1.0)
                         audio = mx.array(audio_np)
                         stream.add_audio(audio)
                         self._apply_stream_result(stream)
