@@ -23,6 +23,7 @@ Bonus: speak commands to **rewrite selected text** via Qwen (opt-in).
 - [Development](#development)
 - [Roadmap](#roadmap)
 - [FAQ](#faq)
+- [How this fork differs from upstream](#how-this-fork-differs-from-upstream)
 - [Credits](#credits)
 - [License](#license)
 
@@ -225,6 +226,22 @@ PARAKEET_LOG=debug parakeet-dictation
 
 **Does dictation send audio to the cloud?** No. Local only.
 **What languages are supported?** English. That's the only one I know :). Feel free to try other languages parkeet supports.
+
+---
+
+## How this fork differs from upstream
+
+This is a fork of [osadalakmal/parakeet-dictation](https://github.com/osadalakmal/parakeet-dictation), diverged over one evening of active development. Substantive changes from upstream `main`:
+
+- **Hotkey**: upstream used a `Ctrl+Alt+A` chord (`keyboard.GlobalHotKeys`, plus a separate listener that stopped on releasing either modifier). This fork holds **right Option** alone — left Option is deliberately left alone so its usual shortcuts (option-drag, special characters) keep working. See [Push-to-talk dictation](#push-to-talk-dictation).
+- **Live streaming dictation**: upstream only transcribed once, on release (one batch call). Here, words are typed as you talk via `parakeet-mlx`'s streaming decoder (`transcribe_stream`) — see `_stream_feed_loop` / `_apply_stream_result` in `main.py`.
+- **Menu bar settings panel**: added an Accuracy submenu (Fast/Balanced/Accurate presets trading latency for context/depth), an Enable Text Editing toggle, and Verbose Logging — all persisted to `~/Library/Application Support/parakeet-dictation/settings.json` (see `settings.py`). Upstream's menu was just Start/Stop Recording and a status line.
+- **Text editing (Qwen) is opt-in**: upstream always loaded the Qwen2.5-1.5B MLX model at startup. Here it's off by default — enable via the "Enable Text Editing (Qwen)" menu item or `PARAKEET_ENABLE_LLM=1`, so a launch that doesn't use it doesn't pay to load/hold it.
+- **Default ASR model**: `parakeet-tdt-0.6b-v2` → `parakeet-tdt-0.6b-v3`, and now configurable via `PARAKEET_MODEL` (hardcoded upstream).
+- **MLX threading fix**: model loading and every transcription now run on one persistent worker thread (`concurrent.futures.ThreadPoolExecutor(max_workers=1)`) instead of ad-hoc `threading.Thread`s. MLX ties lazily-evaluated arrays to the stream of the thread that created them, so crossing threads — as upstream's ad-hoc threads did — could crash with `RuntimeError: There is no Stream(cpu, 1) in current thread.` (see [Development](#development)).
+- **Auto-gain**: quiet/whispered speech gets an RMS-based gain boost per audio chunk before decoding; upstream fed raw levels straight to the model, so quiet audio could decode to no tokens at all.
+- **`install.sh`**: a one-line installer (Homebrew `portaudio`, `uv` if missing, the tool itself, then opens the three permission panes) — upstream requires manually cloning and building a venv from `requirements.txt`.
+- **README rewritten**: installation moved from a `uv venv` + `requirements.txt` workflow to `uv tool install` (see [Installation](#installation)). Most sections below describe this fork's current behavior, not upstream's.
 
 ---
 
